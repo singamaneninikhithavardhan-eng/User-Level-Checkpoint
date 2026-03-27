@@ -2,9 +2,13 @@
 #include <unistd.h>
 
 int main() {
-    while(1) {
-        printf("Aaadutham Biddaaa..\n");
+    int x = 0;
+
+    while (1) {
+        printf("x = %d\nAaaadutham Biddaaaa....\n", x);
+        x++;
         sleep(1);
     }
+
     return 0;
 }
