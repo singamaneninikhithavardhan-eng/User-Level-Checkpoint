@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/ptrace.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -8,90 +9,107 @@
 
 int main(int argc, char *argv[]) {
 
-    if (argc != 3) {
-        printf("Usage: %s <pid> <hex_address>\n", argv[0]);
+    if (argc != 2) {
+        printf("Usage: %s <pid>\n", argv[0]);
         return 1;
     }
 
     pid_t pid = atoi(argv[1]);
-    unsigned long addr = strtoul(argv[2], NULL, 16);
 
     printf("Attaching to process %d...\n", pid);
 
-    // Attach
+    // 🔹 Step 1: Attach
     if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) == -1) {
         perror("ptrace attach failed");
         return 1;
     }
 
     waitpid(pid, NULL, 0);
-    printf("Process paused successfully.\n");
+    printf("Process paused.\n");
 
-    // ======================
-    // STEP 2: REGISTER READ
-    // ======================
+    // 🔹 Step 2: Read registers (optional but useful)
     struct user_regs_struct regs;
 
     if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) == -1) {
-        perror("ptrace getregs failed");
+        perror("getregs failed");
+    } else {
+        printf("RIP: %llx\n", regs.rip);
+        printf("RSP: %llx\n", regs.rsp);
+    }
+
+    // 🔹 Step 3: Open maps file
+    char maps_path[64];
+    sprintf(maps_path, "/proc/%d/maps", pid);
+
+    FILE *maps = fopen(maps_path, "r");
+    if (!maps) {
+        perror("maps open failed");
         return 1;
     }
 
-    printf("\n--- Register Values ---\n");
-    printf("RIP: %llx\n", regs.rip);
-    printf("RSP: %llx\n", regs.rsp);
-    printf("RBP: %llx\n", regs.rbp);
-    printf("------------------------\n");
-
-    // ======================
-    // STEP 3: MEMORY READ
-    // ======================
+    // 🔹 Step 4: Open mem file
     char mem_path[64];
     sprintf(mem_path, "/proc/%d/mem", pid);
 
-    FILE *mem_file = fopen(mem_path, "r");
-    if (!mem_file) {
-        perror("fopen mem failed");
-        ptrace(PTRACE_DETACH, pid, NULL, NULL);
+    FILE *mem = fopen(mem_path, "r");
+    if (!mem) {
+        perror("mem open failed");
         return 1;
     }
 
-    // Move to address
-    if (fseek(mem_file, addr, SEEK_SET) != 0) {
-        perror("fseek failed");
-        fclose(mem_file);
-        ptrace(PTRACE_DETACH, pid, NULL, NULL);
+    // 🔹 Step 5: Output checkpoint file
+    FILE *out = fopen("checkpoint.bin", "wb");
+    if (!out) {
+        perror("output file failed");
         return 1;
     }
 
-    char buffer[64];
+    printf("Dumping memory...\n");
 
-    size_t bytes_read = fread(buffer, 1, sizeof(buffer), mem_file);
-    if (bytes_read == 0) {
-        perror("fread failed");
-        fclose(mem_file);
-        ptrace(PTRACE_DETACH, pid, NULL, NULL);
-        return 1;
+    char line[256];
+
+    // 🔹 Step 6: Loop through memory regions
+    while (fgets(line, sizeof(line), maps)) {
+
+        unsigned long start, end;
+        char perms[5];
+
+        sscanf(line, "%lx-%lx %4s", &start, &end, perms);
+
+        // 🔹 Only readable regions
+        if (perms[0] != 'r') continue;
+
+        unsigned long size = end - start;
+
+        char *buffer = malloc(size);
+        if (!buffer) continue;
+
+        // Move to memory region
+        if (fseek(mem, start, SEEK_SET) != 0) {
+            free(buffer);
+            continue;
+        }
+
+        size_t bytes = fread(buffer, 1, size, mem);
+
+        // Write to file
+        fwrite(buffer, 1, bytes, out);
+
+        printf("Dumped region: %lx - %lx (%lu bytes)\n", start, end, size);
+
+        free(buffer);
     }
 
-    printf("\n--- Memory Data at %lx ---\n", addr);
-    for (int i = 0; i < bytes_read; i++) {
-        printf("%02x ", (unsigned char)buffer[i]);
-    }
-    printf("\n---------------------------\n");
+    fclose(maps);
+    fclose(mem);
+    fclose(out);
 
-    fclose(mem_file);
+    printf("Memory dump saved to checkpoint.bin\n");
 
-    sleep(3);
+    sleep(2);
 
-    // Detach
-    printf("\nDetaching and resuming process...\n");
-
-    if (ptrace(PTRACE_DETACH, pid, NULL, NULL) == -1) {
-        perror("ptrace detach failed");
-        return 1;
-    }
-
+    // 🔹 Detach
+    ptrace(PTRACE_DETACH, pid, NULL, NULL);
     printf("Process resumed.\n");
 
     return 0;
