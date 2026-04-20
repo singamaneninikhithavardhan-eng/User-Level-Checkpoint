@@ -6,6 +6,15 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <sys/user.h>
+#include <dirent.h>
+#include <limits.h>
+#include <time.h>
+
+typedef struct {
+    unsigned long start;
+    unsigned long size;
+    char perms[5];
+} region_meta;
 
 int main(int argc, char *argv[]) {
 
@@ -16,52 +25,65 @@ int main(int argc, char *argv[]) {
 
     pid_t pid = atoi(argv[1]);
 
-    printf("Attaching to process %d...\n", pid);
-
-    // 🔹 Step 1: Attach
+    // 🔹 Attach
     if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) == -1) {
-        perror("ptrace attach failed");
+        perror("attach failed");
         return 1;
     }
 
     waitpid(pid, NULL, 0);
     printf("Process paused.\n");
 
-    // 🔹 Step 2: Get registers
+    // 🔹 Get registers
     struct user_regs_struct regs;
-
     if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) == -1) {
         perror("getregs failed");
-        ptrace(PTRACE_DETACH, pid, NULL, NULL);
         return 1;
     }
 
-    printf("Registers captured.\n");
+    // 🔴 ROLLING CHECKPOINT LOGIC
+    char filename[32] = "checkpoint_A.bin";
 
-    // 🔹 Step 3: Open files
+    FILE *meta_in = fopen("metadata.txt", "r");
+    if (meta_in) {
+        char line[128];
+        while (fgets(line, sizeof(line), meta_in)) {
+            if (strstr(line, "LATEST_CHECKPOINT=checkpoint_A.bin")) {
+                strcpy(filename, "checkpoint_B.bin");
+            } else if (strstr(line, "LATEST_CHECKPOINT=checkpoint_B.bin")) {
+                strcpy(filename, "checkpoint_A.bin");
+            }
+        }
+        fclose(meta_in);
+    }
+
+    printf("Saving checkpoint to %s\n", filename);
+
+    FILE *out = fopen(filename, "wb");
+    if (!out) {
+        perror("checkpoint file open failed");
+        return 1;
+    }
+
+    // 🔹 Write registers
+    fwrite(&regs, sizeof(regs), 1, out);
+
+    // 🔹 Open maps & mem
     char maps_path[64], mem_path[64];
-
     sprintf(maps_path, "/proc/%d/maps", pid);
     sprintf(mem_path, "/proc/%d/mem", pid);
 
     FILE *maps = fopen(maps_path, "r");
     FILE *mem  = fopen(mem_path, "r");
-    FILE *out  = fopen("checkpoint.bin", "wb");
 
-    if (!maps || !mem || !out) {
-        perror("file open failed");
-        ptrace(PTRACE_DETACH, pid, NULL, NULL);
+    if (!maps || !mem) {
+        perror("maps/mem open failed");
         return 1;
     }
 
-    // 🔹 Step 4: WRITE REGISTERS FIRST
-    fwrite(&regs, sizeof(regs), 1, out);
-
-    printf("Registers written to checkpoint.\n");
-
     char line[256];
 
-    // 🔹 Step 5: Loop through memory regions
+    // 🔹 Memory dump
     while (fgets(line, sizeof(line), maps)) {
 
         unsigned long start, end;
@@ -69,15 +91,18 @@ int main(int argc, char *argv[]) {
 
         sscanf(line, "%lx-%lx %4s", &start, &end, perms);
 
-        // Only readable regions
         if (perms[0] != 'r') continue;
 
         unsigned long size = end - start;
 
+        region_meta meta;
+        meta.start = start;
+        meta.size = size;
+        strcpy(meta.perms, perms);
+
         char *buffer = malloc(size);
         if (!buffer) continue;
 
-        // Move to region
         if (fseek(mem, start, SEEK_SET) != 0) {
             free(buffer);
             continue;
@@ -89,36 +114,70 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        // 🔹 WRITE METADATA (VERY IMPORTANT)
-        fwrite(&start, sizeof(start), 1, out);
-        fwrite(&size, sizeof(size), 1, out);
-
-        // 🔹 WRITE MEMORY DATA
+        fwrite(&meta, sizeof(meta), 1, out);
         fwrite(buffer, 1, bytes, out);
 
-        printf("Saved region: %lx - %lx (%lu bytes)\n", start, end, size);
+        printf("Saved: %lx (%lu bytes)\n", start, size);
 
         free(buffer);
     }
 
-    // 🔹 Step 6: END MARKER
-    unsigned long end_marker = 0;
-    fwrite(&end_marker, sizeof(end_marker), 1, out);
+    // 🔹 End marker
+    region_meta end = {0, 0, ""};
+    fwrite(&end, sizeof(end), 1, out);
 
-    printf("End marker written.\n");
-
-    // 🔹 Close files
     fclose(maps);
     fclose(mem);
     fclose(out);
 
-    printf("Checkpoint saved: checkpoint.bin\n");
+    printf("Memory checkpoint done.\n");
 
-    sleep(2);
+    // 🔴 STEP 6: FILE DESCRIPTOR CAPTURE
+    DIR *dir;
+    struct dirent *entry;
+
+    char fd_path[64];
+    sprintf(fd_path, "/proc/%d/fd", pid);
+
+    dir = opendir(fd_path);
+    FILE *fd_file = fopen("fds.txt", "w");
+
+    if (dir && fd_file) {
+        while ((entry = readdir(dir)) != NULL) {
+
+            if (entry->d_name[0] == '.') continue;
+
+            char link_path[128], target[PATH_MAX];
+
+            sprintf(link_path, "%s/%s", fd_path, entry->d_name);
+
+            ssize_t len = readlink(link_path, target, sizeof(target) - 1);
+
+            if (len != -1) {
+                target[len] = '\0';
+                fprintf(fd_file, "%s %s\n", entry->d_name, target);
+            }
+        }
+
+        closedir(dir);
+        fclose(fd_file);
+    }
+
+    printf("File descriptors saved.\n");
+
+    // 🔹 Update metadata
+    FILE *meta = fopen("metadata.txt", "w");
+    if (meta) {
+        fprintf(meta, "LATEST_CHECKPOINT=%s\n", filename);
+        fprintf(meta, "TIMESTAMP=%ld\n", time(NULL));
+        fprintf(meta, "PID=%d\n", pid);
+        fclose(meta);
+    }
 
     // 🔹 Detach
     ptrace(PTRACE_DETACH, pid, NULL, NULL);
-    printf("Process resumed.\n");
+
+    printf("Checkpoint complete.\n");
 
     return 0;
 }

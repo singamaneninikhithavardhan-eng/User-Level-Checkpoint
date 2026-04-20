@@ -4,8 +4,11 @@
 int main() {
     int x = 0;
 
+    FILE *f = fopen("log.txt", "a");
+
     while (1) {
-        printf("x = %d\nAaaadutham Biddaaaa....\n", x);
+        fprintf(f, "x = %d\n", x);
+        fflush(f);   // VERY IMPORTANT
         x++;
         sleep(1);
     }
